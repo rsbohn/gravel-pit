@@ -18,5 +18,35 @@
     "priority": 0,
     "created_date": "2026-01-31T11:51:09.823640",
     "updated_date": "2026-01-31T11:51:09.919568"
+  },
+  {
+    "id": 3,
+    "title": "External issue sync",
+    "description": "Import and sync issues from external repositories (GitHub, GitLab, etc). Support importing issues, marking them complete locally with comments, and syncing back to remote.",
+    "type": "feature",
+    "status": "proposed",
+    "priority": 8,
+    "created_date": "2026-01-31T11:58:21.867303",
+    "updated_date": "2026-01-31T11:58:21.867303"
+  },
+  {
+    "id": 5,
+    "title": "Setup gh CLI for external sync",
+    "description": "Blocker for feature #3 (External issue sync). Use GitHub CLI (gh) for importing and syncing GitHub issues. Add installation help: detect if gh is installed, provide clear error message with installation instructions (brew install gh, or https://cli.github.com) if not found.",
+    "type": "issue",
+    "status": "proposed",
+    "priority": 9,
+    "created_date": "2026-01-31T12:00:43.503336",
+    "updated_date": "2026-01-31T12:00:43.503336"
+  },
+  {
+    "id": 6,
+    "title": "Add issue linking/dependencies",
+    "description": "Add support for linking issues together (blocks, depends_on, related_to). This will help track issue dependencies like issue #5 blocking feature #3.",
+    "type": "feature",
+    "status": "proposed",
+    "priority": 6,
+    "created_date": "2026-01-31T12:00:49.786061",
+    "updated_date": "2026-01-31T12:00:49.786061"
   }
 ]
