@@ -48,5 +48,25 @@
     "priority": 6,
     "created_date": "2026-01-31T12:00:49.786061",
     "updated_date": "2026-01-31T12:00:49.786061"
+  },
+  {
+    "id": 7,
+    "title": "Focus an external repository",
+    "description": "clone (if needed) an external repository. For example: <<focus git@github:rsbohn/ashen-petrel.git>>",
+    "type": "feature",
+    "status": "proposed",
+    "priority": 0,
+    "created_date": "2026-01-31T12:04:57.680054",
+    "updated_date": "2026-01-31T12:04:57.680054"
+  },
+  {
+    "id": 8,
+    "title": "sync: export and commit",
+    "description": "<<eb sync>> should export the database, stage the export file, and commit.",
+    "type": "feature",
+    "status": "proposed",
+    "priority": 0,
+    "created_date": "2026-01-31T12:07:09.537213",
+    "updated_date": "2026-01-31T12:07:09.537213"
   }
 ]
