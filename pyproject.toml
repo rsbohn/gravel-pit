@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "gravel-pit"
+version = "0.1.0"
+description = "EasyBeans - Simple issue tracker with SQLite and git-friendly exports"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.scripts]
+eb = "eb.eb:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["eb"]
+
+[tool.uv]
+package = true
