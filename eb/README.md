@@ -4,7 +4,8 @@ A lightweight SQLite-based issue tracker with git-friendly exports.
 
 ## Features
 
-- **Track issues and features** with status workflow: proposed → ready → in progress → completed → done
+- **Track issues, features, and epics** with status workflow: proposed → ready → in progress → completed → done
+- **Parent/child relationships** to group items (epics contain features/issues; features contain issues)
 - **Priority levels** for organizing work
 - **SQLite backend** for persistent storage
 - **Git-friendly exports** to JSON and CSV for version control
@@ -29,17 +30,19 @@ Now you can use `uv run eb` from anywhere in the project.
 
 ## Usage
 
-### Add an issue or feature
+### Add an issue, feature, or epic
 
 ```bash
 uv run eb add "Fix login bug" -d "Users can't log in with Google" -t issue -p 10
 uv run eb add "Dark mode" -t feature -p 5
+uv run eb add "UI refresh" -t epic -p 3
 ```
 
 Options:
 - `-d, --description`: Description (optional)
-- `-t, --type`: Type - "issue" or "feature" (default: issue)
+- `-t, --type`: Type - "issue", "feature", or "epic" (default: issue)
 - `-p, --priority`: Priority level (default: 0, higher = more urgent)
+- `--parent`: Parent item ID (optional)
 
 ### List items
 
@@ -71,6 +74,13 @@ uv run eb status 1 "completed" --comment "Fixed locally; closing upstream."
 uv run eb delete 1
 ```
 
+### Set or clear a parent
+
+```bash
+uv run eb parent 12 4
+uv run eb parent 12 --clear
+```
+
 ### Export for git tracking
 
 ```bash
@@ -84,6 +94,20 @@ Exported file is placed in `eb/exports/items.json` and can be committed to git f
 ```bash
 uv run eb sync
 uv run eb sync -m "eb export"
+```
+
+### Migrate database schema
+
+```bash
+uv run eb migrate
+uv run eb migrate --dry-run
+uv run eb migrate --to-version 2
+```
+
+### Show versions
+
+```bash
+uv run eb version
 ```
 
 ### Check GitHub CLI (gh)
@@ -116,11 +140,16 @@ The SQLite database has a single `items` table with:
 - `id`: Auto-incrementing primary key
 - `title`: Item title (required)
 - `description`: Detailed description (optional)
-- `type`: "issue" or "feature"
+- `type`: "issue", "feature", or "epic"
 - `status`: Current status (proposed, ready, in progress, completed, done)
 - `priority`: Integer priority level
 - `created_date`: ISO format timestamp
 - `updated_date`: ISO format timestamp
+- `parent_id`: Parent item ID (optional)
+
+## Schema Versioning
+
+The database stores a `schema_version` table. On startup, eb will migrate older schemas to the current version.
 
 ## Status Workflow
 

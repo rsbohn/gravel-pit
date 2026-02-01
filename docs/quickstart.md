@@ -46,13 +46,28 @@ uv run eb add "Fix the login bug" \
 
 Options:
 - `-d, --description` - Detailed description
-- `-t, --type` - Type: `issue` or `feature` (default: issue)
+- `-t, --type` - Type: `issue`, `feature`, or `epic` (default: issue)
 - `-p, --priority` - Priority level 0-10 (higher = more urgent)
+- `--parent` - Parent item ID (optional)
 
 ### Create a Feature
 
 ```bash
 uv run eb add "Dark mode support" -t feature -p 5
+```
+
+### Create an Epic
+
+```bash
+uv run eb add "Accessibility overhaul" -t epic -p 5
+```
+
+### Link an item to a parent
+
+```bash
+uv run eb add "Color contrast fixes" -t issue --parent 3
+uv run eb parent 5 3
+uv run eb parent 5 --clear
 ```
 
 ### View Your Items

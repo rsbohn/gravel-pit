@@ -12,14 +12,30 @@ from pathlib import Path
 import json
 import shutil
 import subprocess
+from importlib import metadata
 
-DB_FILE = Path(__file__).parent / "issues.db"
-EXPORT_DIR = Path(__file__).parent / "exports"
-EXPORT_FILE = EXPORT_DIR / "items.json"
+def get_project_base():
+    local_db = Path.cwd() / "eb" / "issues.db"
+    if local_db.is_file():
+        return local_db.parent
+    return Path(__file__).parent
+
+
+def get_db_file():
+    return get_project_base() / "issues.db"
+
+
+def get_export_dir():
+    return get_project_base() / "exports"
+
+
+def get_export_file():
+    return get_export_dir() / "items.json"
 
 # Status workflow: proposed -> ready -> in progress -> completed -> done
 VALID_STATUSES = ["proposed", "ready", "in progress", "completed", "done"]
-VALID_TYPES = ["issue", "feature"]
+VALID_TYPES = ["issue", "feature", "epic"]
+CURRENT_SCHEMA_VERSION = 2
 EXTERNAL_COLUMNS = {
     "external_source": "TEXT",
     "external_id": "TEXT",
@@ -29,25 +45,31 @@ EXTERNAL_COLUMNS = {
     "external_updated": "TEXT",
     "external_comment": "TEXT",
 }
+PARENT_COLUMNS = {
+    "parent_id": "INTEGER",
+}
 
 
-def init_db():
+def init_db(db_file=None):
     """Initialize the SQLite database with schema."""
-    conn = sqlite3.connect(DB_FILE)
+    db_file = db_file or get_db_file()
+    db_file.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_file)
     c = conn.cursor()
     
     c.execute('''CREATE TABLE IF NOT EXISTS items (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         title TEXT NOT NULL,
         description TEXT,
-        type TEXT NOT NULL DEFAULT 'issue' CHECK(type IN ('issue', 'feature')),
+        type TEXT NOT NULL DEFAULT 'issue' CHECK(type IN ('issue', 'feature', 'epic')),
         status TEXT NOT NULL DEFAULT 'proposed' CHECK(status IN ('proposed', 'ready', 'in progress', 'completed', 'done')),
         priority INTEGER DEFAULT 0,
         created_date TEXT NOT NULL,
-        updated_date TEXT NOT NULL
+        updated_date TEXT NOT NULL,
+        parent_id INTEGER
     )''')
 
-    ensure_columns(conn)
+    ensure_schema(conn)
 
     conn.commit()
     conn.close()
@@ -55,7 +77,7 @@ def init_db():
 
 def get_db():
     """Get database connection."""
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(get_db_file())
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -64,13 +86,245 @@ def ensure_columns(conn):
     """Add missing columns for newer features."""
     c = conn.cursor()
     existing = {row[1] for row in c.execute("PRAGMA table_info(items)")}
-    for column, col_type in EXTERNAL_COLUMNS.items():
+    for column, col_type in {**PARENT_COLUMNS, **EXTERNAL_COLUMNS}.items():
         if column not in existing:
             c.execute(f"ALTER TABLE items ADD COLUMN {column} {col_type}")
 
 
-def add_item(title, description=None, item_type="issue", priority=0):
-    """Add a new issue or feature."""
+def table_supports_epic(conn):
+    c = conn.cursor()
+    c.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'items'")
+    row = c.fetchone()
+    if not row or not row[0]:
+        return True
+    sql = row[0]
+    if "CHECK(type IN" not in sql:
+        return True
+    return "'epic'" in sql
+
+
+def has_column(conn, column_name):
+    c = conn.cursor()
+    existing = {row[1] for row in c.execute("PRAGMA table_info(items)")}
+    return column_name in existing
+
+
+def schema_version_table_exists(conn):
+    c = conn.cursor()
+    c.execute("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'schema_version'")
+    return c.fetchone() is not None
+
+
+def ensure_schema_version_table(conn):
+    c = conn.cursor()
+    c.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)")
+
+
+def get_schema_version(conn):
+    if not schema_version_table_exists(conn):
+        return None
+    c = conn.cursor()
+    c.execute("SELECT version FROM schema_version LIMIT 1")
+    row = c.fetchone()
+    if not row:
+        return None
+    return row[0]
+
+
+def set_schema_version(conn, version):
+    c = conn.cursor()
+    c.execute("DELETE FROM schema_version")
+    c.execute("INSERT INTO schema_version (version) VALUES (?)", (version,))
+
+
+def get_app_version():
+    try:
+        return metadata.version("gravel-pit")
+    except metadata.PackageNotFoundError:
+        return "unknown"
+
+
+def read_db_schema_version():
+    db_file = get_db_file()
+    if not db_file.exists():
+        return None
+    conn = sqlite3.connect(db_file)
+    try:
+        if not schema_version_table_exists(conn):
+            return infer_schema_version(conn)
+        version = get_schema_version(conn)
+        if version is None:
+            return infer_schema_version(conn)
+        return version
+    finally:
+        conn.close()
+
+
+def infer_schema_version(conn):
+    c = conn.cursor()
+    c.execute("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'items'")
+    if not c.fetchone():
+        return CURRENT_SCHEMA_VERSION
+    if not table_supports_epic(conn):
+        return 1
+    if not has_column(conn, "parent_id"):
+        return 1
+    return 2
+
+
+def rebuild_items_table(conn):
+    c = conn.cursor()
+    c.execute("ALTER TABLE items RENAME TO items_old")
+    c.execute('''CREATE TABLE items (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT NOT NULL,
+        description TEXT,
+        type TEXT NOT NULL DEFAULT 'issue' CHECK(type IN ('issue', 'feature', 'epic')),
+        status TEXT NOT NULL DEFAULT 'proposed' CHECK(status IN ('proposed', 'ready', 'in progress', 'completed', 'done')),
+        priority INTEGER DEFAULT 0,
+        created_date TEXT NOT NULL,
+        updated_date TEXT NOT NULL,
+        parent_id INTEGER,
+        external_source TEXT,
+        external_id TEXT,
+        external_url TEXT,
+        external_repo TEXT,
+        external_state TEXT,
+        external_updated TEXT,
+        external_comment TEXT
+    )''')
+
+    existing = {row[1] for row in c.execute("PRAGMA table_info(items_old)")}
+    new_columns = [
+        "id",
+        "title",
+        "description",
+        "type",
+        "status",
+        "priority",
+        "created_date",
+        "updated_date",
+        "parent_id",
+        *EXTERNAL_COLUMNS.keys(),
+    ]
+    select_columns = [
+        col if col in existing else f"NULL AS {col}"
+        for col in new_columns
+    ]
+    c.execute(
+        f"INSERT INTO items ({', '.join(new_columns)}) "
+        f"SELECT {', '.join(select_columns)} FROM items_old"
+    )
+    c.execute("DROP TABLE items_old")
+
+
+def migrate_1_to_2(conn, dry_run=False):
+    if dry_run:
+        return
+    if not table_supports_epic(conn):
+        rebuild_items_table(conn)
+    ensure_columns(conn)
+
+
+MIGRATIONS = {
+    1: migrate_1_to_2,
+}
+
+
+def run_migrations(conn, target_version=CURRENT_SCHEMA_VERSION, dry_run=False):
+    ensure_schema_version_table(conn)
+    version = get_schema_version(conn)
+    if version is None:
+        version = infer_schema_version(conn)
+        if not dry_run:
+            print(f"Info: initialized schema version tracking at {version}.")
+            set_schema_version(conn, version)
+
+    if version > target_version:
+        print(
+            f"Error: database schema version {version} is newer than supported {target_version}.",
+            file=sys.stderr,
+        )
+        return False
+
+    if version == target_version:
+        return True
+
+    current = version
+    if not dry_run:
+        print(f"Info: migrating database schema from {version} to {target_version}.")
+    while current < target_version:
+        migrate_fn = MIGRATIONS.get(current)
+        if not migrate_fn:
+            print(
+                f"Error: missing migration from version {current} to {current + 1}.",
+                file=sys.stderr,
+            )
+            return False
+        if dry_run:
+            print(f"• Would migrate schema {current} -> {current + 1}")
+        else:
+            migrate_fn(conn, dry_run=False)
+            set_schema_version(conn, current + 1)
+            print(f"✓ Migrated schema {current} -> {current + 1}")
+        current += 1
+
+    return True
+
+
+def ensure_schema(conn):
+    return run_migrations(conn, CURRENT_SCHEMA_VERSION, dry_run=False)
+
+
+def fetch_item(conn, item_id):
+    c = conn.cursor()
+    c.execute("SELECT * FROM items WHERE id = ?", (item_id,))
+    return c.fetchone()
+
+
+def get_parent_chain(conn, item_id):
+    chain = []
+    current_id = item_id
+    visited = set()
+    while current_id:
+        if current_id in visited:
+            break
+        visited.add(current_id)
+        row = fetch_item(conn, current_id)
+        if not row:
+            break
+        parent_id = row["parent_id"]
+        if not parent_id:
+            break
+        chain.append(parent_id)
+        current_id = parent_id
+    return chain
+
+
+def validate_parent_assignment(conn, child_type, parent_id, child_id=None):
+    if parent_id is None:
+        return True
+    if child_type == "epic":
+        print("Error: epics cannot have a parent.", file=sys.stderr)
+        return False
+    parent = fetch_item(conn, parent_id)
+    if not parent:
+        print(f"Error: Parent item #{parent_id} not found.", file=sys.stderr)
+        return False
+    parent_type = parent["type"]
+    if parent_type == "epic" and child_type in {"issue", "feature"}:
+        return True
+    if parent_type == "feature" and child_type == "issue":
+        return True
+    print(
+        f"Error: {parent_type} items cannot contain {child_type} items.",
+        file=sys.stderr,
+    )
+    return False
+
+
+def add_item(title, description=None, item_type="issue", priority=0, parent_id=None):
+    """Add a new issue, feature, or epic."""
     if item_type not in VALID_TYPES:
         print(f"Error: type must be one of {VALID_TYPES}")
         return False
@@ -78,10 +332,15 @@ def add_item(title, description=None, item_type="issue", priority=0):
     conn = get_db()
     c = conn.cursor()
     now = datetime.now().isoformat()
+
+    if parent_id is not None:
+        if not validate_parent_assignment(conn, item_type, parent_id):
+            conn.close()
+            return False
     
-    c.execute('''INSERT INTO items (title, description, type, status, priority, created_date, updated_date)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)''',
-              (title, description, item_type, "proposed", priority, now, now))
+    c.execute('''INSERT INTO items (title, description, type, status, priority, created_date, updated_date, parent_id)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+              (title, description, item_type, "proposed", priority, now, now, parent_id))
     
     conn.commit()
     item_id = c.lastrowid
@@ -117,13 +376,14 @@ def list_items(status=None, item_type=None):
         return
     
     # Print header
-    print(f"\n{'ID':<4} {'Type':<8} {'Status':<12} {'Priority':<8} {'Title':<40}")
-    print("-" * 80)
+    print(f"\n{'ID':<4} {'Type':<8} {'Status':<12} {'Priority':<8} {'Parent':<6} {'Title':<34}")
+    print("-" * 86)
     
     for item in items:
         status_display = item['status'].ljust(12)
-        title_display = item['title'][:40].ljust(40)
-        print(f"{item['id']:<4} {item['type']:<8} {status_display} {item['priority']:<8} {title_display}")
+        title_display = item['title'][:34].ljust(34)
+        parent_display = str(item['parent_id']) if item['parent_id'] else "-"
+        print(f"{item['id']:<4} {item['type']:<8} {status_display} {item['priority']:<8} {parent_display:<6} {title_display}")
 
 
 def show_item(item_id):
@@ -131,8 +391,7 @@ def show_item(item_id):
     conn = get_db()
     c = conn.cursor()
     
-    c.execute("SELECT * FROM items WHERE id = ?", (item_id,))
-    item = c.fetchone()
+    item = fetch_item(conn, item_id)
     conn.close()
     
     if not item:
@@ -144,9 +403,32 @@ def show_item(item_id):
     print(f"{'Type:':<15} {item['type']}")
     print(f"{'Status:':<15} {item['status']}")
     print(f"{'Priority:':<15} {item['priority']}")
+    if item["parent_id"]:
+        conn = get_db()
+        parent = fetch_item(conn, item["parent_id"])
+        conn.close()
+        if parent:
+            parent_label = f"{parent['id']}: {parent['title']}"
+        else:
+            parent_label = f"{item['parent_id']} (missing)"
+        print(f"{'Parent:':<15} {parent_label}")
+    else:
+        print(f"{'Parent:':<15} None")
     print(f"{'Description:':<15} {item['description'] or 'N/A'}")
     print(f"{'Created:':<15} {item['created_date']}")
     print(f"{'Updated:':<15} {item['updated_date']}")
+    conn = get_db()
+    c = conn.cursor()
+    c.execute(
+        "SELECT id, title, type, status FROM items WHERE parent_id = ? ORDER BY priority DESC, created_date ASC",
+        (item_id,),
+    )
+    children = c.fetchall()
+    conn.close()
+    if children:
+        print(f"{'Children:':<15} {len(children)}")
+        for child in children:
+            print(f"{'':<15} #{child['id']} [{child['type']}] {child['status']} - {child['title']}")
     print()
     
     return True
@@ -202,9 +484,57 @@ def delete_item(item_id):
     return True
 
 
+def set_parent(child_id, parent_id=None):
+    conn = get_db()
+    c = conn.cursor()
+
+    child = fetch_item(conn, child_id)
+    if not child:
+        print(f"Error: Item #{child_id} not found", file=sys.stderr)
+        conn.close()
+        return False
+
+    if parent_id is None:
+        now = datetime.now().isoformat()
+        c.execute(
+            "UPDATE items SET parent_id = NULL, updated_date = ? WHERE id = ?",
+            (now, child_id),
+        )
+        conn.commit()
+        conn.close()
+        print(f"✓ Cleared parent for item #{child_id}")
+        return True
+
+    if parent_id == child_id:
+        print("Error: Item cannot be its own parent.", file=sys.stderr)
+        conn.close()
+        return False
+
+    if not validate_parent_assignment(conn, child["type"], parent_id, child_id=child_id):
+        conn.close()
+        return False
+
+    parent_chain = get_parent_chain(conn, parent_id)
+    if child_id in parent_chain:
+        print("Error: Parent assignment would create a cycle.", file=sys.stderr)
+        conn.close()
+        return False
+
+    now = datetime.now().isoformat()
+    c.execute(
+        "UPDATE items SET parent_id = ?, updated_date = ? WHERE id = ?",
+        (parent_id, now, child_id),
+    )
+    conn.commit()
+    conn.close()
+    print(f"✓ Set parent of item #{child_id} to #{parent_id}")
+    return True
+
+
 def export_json():
     """Export all items to JSON for git tracking."""
-    EXPORT_DIR.mkdir(exist_ok=True)
+    export_dir = get_export_dir()
+    export_dir.mkdir(parents=True, exist_ok=True)
     
     conn = get_db()
     c = conn.cursor()
@@ -214,10 +544,11 @@ def export_json():
     
     data = [dict(item) for item in items]
     
-    with open(EXPORT_FILE, 'w') as f:
+    export_file = get_export_file()
+    with open(export_file, 'w') as f:
         json.dump(data, f, indent=2)
     
-    print(f"✓ Exported {len(data)} items to {EXPORT_FILE}")
+    print(f"✓ Exported {len(data)} items to {export_file}")
 
 
 def check_gh_cli():
@@ -472,15 +803,36 @@ def run_git(args, cwd):
     return result.stdout
 
 
+def get_repo_root(start_dir):
+    result = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        capture_output=True,
+        text=True,
+        cwd=start_dir,
+    )
+    if result.returncode != 0:
+        return None
+    output = result.stdout.strip()
+    if not output:
+        return None
+    return Path(output)
+
+
 def sync_export_commit(message="eb export"):
     """Export items, stage the export, and commit."""
     export_json()
 
-    repo_root = Path(__file__).resolve().parents[1]
-    if run_git(["rev-parse", "--is-inside-work-tree"], cwd=repo_root) is None:
+    export_file = get_export_file()
+    repo_root = get_repo_root(export_file.parent)
+    if repo_root is None:
+        print("Error: Not inside a git repository.", file=sys.stderr)
         return False
 
-    relative_export = EXPORT_FILE.relative_to(repo_root)
+    try:
+        relative_export = export_file.relative_to(repo_root)
+    except ValueError:
+        print("Error: Export file is not inside the git repository.", file=sys.stderr)
+        return False
     status = run_git(["status", "--porcelain", str(relative_export)], cwd=repo_root)
     if status is None:
         return False
@@ -499,17 +851,40 @@ def sync_export_commit(message="eb export"):
     return True
 
 
+def init_project():
+    project_dir = Path.cwd() / "eb"
+    if project_dir.exists() and not project_dir.is_dir():
+        print("Error: ./eb exists and is not a directory.", file=sys.stderr)
+        return False
+
+    project_dir.mkdir(exist_ok=True)
+    db_file = project_dir / "issues.db"
+    init_db(db_file=db_file)
+
+    export_dir = project_dir / "exports"
+    export_dir.mkdir(exist_ok=True)
+
+    print(f"✓ Initialized eb project at {project_dir}")
+    return True
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="EasyBeans (eb) - Simple Issue Tracker",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+  eb init
   eb add "Fix login bug" -d "Users can't log in with Google" -t issue -p 10
+  eb add "Theme overhaul" -t epic -p 3
+  eb add "Dark mode" -t feature --parent 2
+  eb add "Fix contrast" -t issue --parent 3
   eb list
   eb list --status "in progress"
   eb show 1
   eb status 1 "ready"
+  eb parent 4 2
+  eb parent 4 --clear
   eb delete 1
   eb export
   eb gh
@@ -519,13 +894,17 @@ Examples:
     )
     
     subparsers = parser.add_subparsers(dest="command", help="Command to run")
+
+    # Init command
+    subparsers.add_parser("init", help="Initialize a new eb project in ./eb")
     
     # Add command
-    add_parser = subparsers.add_parser("add", help="Add a new issue or feature")
-    add_parser.add_argument("title", help="Title of the issue/feature")
+    add_parser = subparsers.add_parser("add", help="Add a new issue, feature, or epic")
+    add_parser.add_argument("title", help="Title of the item")
     add_parser.add_argument("-d", "--description", help="Description")
     add_parser.add_argument("-t", "--type", choices=VALID_TYPES, default="issue", help="Type (default: issue)")
     add_parser.add_argument("-p", "--priority", type=int, default=0, help="Priority level (default: 0)")
+    add_parser.add_argument("--parent", type=int, help="Parent item ID")
     
     # List command
     list_parser = subparsers.add_parser("list", help="List all items")
@@ -545,6 +924,12 @@ Examples:
     # Delete command
     delete_parser = subparsers.add_parser("delete", help="Delete an item")
     delete_parser.add_argument("id", type=int, help="Item ID")
+
+    # Parent command
+    parent_parser = subparsers.add_parser("parent", help="Set or clear an item's parent")
+    parent_parser.add_argument("child_id", type=int, help="Child item ID")
+    parent_parser.add_argument("parent_id", type=int, nargs="?", help="Parent item ID")
+    parent_parser.add_argument("--clear", action="store_true", help="Clear the current parent")
     
     # Export command
     export_parser = subparsers.add_parser("export", help="Export items to JSON")
@@ -552,6 +937,14 @@ Examples:
     # Sync command
     sync_parser = subparsers.add_parser("sync", help="Export items and commit JSON")
     sync_parser.add_argument("-m", "--message", default="eb export", help="Commit message")
+
+    # Migrate command
+    migrate_parser = subparsers.add_parser("migrate", help="Migrate database schema")
+    migrate_parser.add_argument("--dry-run", action="store_true", help="Show migrations without applying them")
+    migrate_parser.add_argument("--to-version", type=int, default=CURRENT_SCHEMA_VERSION, help="Target schema version")
+
+    # Version command
+    subparsers.add_parser("version", help="Show app and schema version")
 
     # GitHub CLI check command
     gh_parser = subparsers.add_parser("gh", help="Check GitHub CLI (gh) availability")
@@ -570,17 +963,21 @@ Examples:
     github_push.add_argument("--dry-run", action="store_true", help="Show actions without applying them")
     
     args = parser.parse_args()
-    
-    # Initialize database
-    init_db()
-    
-    # Handle commands
+
     if not args.command:
         parser.print_help()
         return
+
+    if args.command == "init":
+        init_project()
+        return
+
+    # Initialize database for standard commands
+    if args.command not in {"version"}:
+        init_db()
     
     if args.command == "add":
-        add_item(args.title, args.description, args.type, args.priority)
+        add_item(args.title, args.description, args.type, args.priority, args.parent)
     elif args.command == "list":
         list_items(args.status, args.type)
     elif args.command == "show":
@@ -589,12 +986,31 @@ Examples:
         update_status(args.id, args.status, args.comment)
     elif args.command == "delete":
         delete_item(args.id)
+    elif args.command == "parent":
+        if args.clear:
+            set_parent(args.child_id, None)
+        elif args.parent_id is None:
+            print("Error: parent_id is required unless --clear is used.", file=sys.stderr)
+        else:
+            set_parent(args.child_id, args.parent_id)
     elif args.command == "export":
         export_json()
     elif args.command == "gh":
         check_gh_cli()
     elif args.command == "sync":
         sync_export_commit(args.message)
+    elif args.command == "migrate":
+        conn = get_db()
+        run_migrations(conn, args.to_version, args.dry_run)
+        conn.close()
+    elif args.command == "version":
+        app_version = get_app_version()
+        db_version = read_db_schema_version()
+        print(f"EasyBeans version: {app_version}")
+        if db_version is None:
+            print(f"Database schema version: not initialized (current: {CURRENT_SCHEMA_VERSION})")
+        else:
+            print(f"Database schema version: {db_version} (current: {CURRENT_SCHEMA_VERSION})")
     elif args.command == "github":
         if not args.github_command:
             github_parser.print_help()
