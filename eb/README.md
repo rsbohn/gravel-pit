@@ -62,6 +62,7 @@ uv run eb status 1 "ready"
 uv run eb status 1 "in progress"
 uv run eb status 1 "completed"
 uv run eb status 1 "done"
+uv run eb status 1 "completed" --comment "Fixed locally; closing upstream."
 ```
 
 ### Delete an item
@@ -77,6 +78,36 @@ uv run eb export
 ```
 
 Exported file is placed in `eb/exports/items.json` and can be committed to git for tracking changes over time.
+
+### Sync export and commit
+
+```bash
+uv run eb sync
+uv run eb sync -m "eb export"
+```
+
+### Check GitHub CLI (gh)
+
+External sync will require the GitHub CLI. You can verify it is installed:
+
+```bash
+uv run eb gh
+```
+
+### Sync GitHub issues
+
+Import issues from GitHub:
+
+```bash
+uv run eb github import owner/repo
+```
+
+Push completed items (status `completed`/`done`) back to GitHub:
+
+```bash
+uv run eb github push owner/repo
+uv run eb github push owner/repo --dry-run
+```
 
 ## Database Schema
 

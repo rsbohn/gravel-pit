@@ -10,13 +10,25 @@ import sys
 from datetime import datetime
 from pathlib import Path
 import json
+import shutil
+import subprocess
 
 DB_FILE = Path(__file__).parent / "issues.db"
 EXPORT_DIR = Path(__file__).parent / "exports"
+EXPORT_FILE = EXPORT_DIR / "items.json"
 
 # Status workflow: proposed -> ready -> in progress -> completed -> done
 VALID_STATUSES = ["proposed", "ready", "in progress", "completed", "done"]
 VALID_TYPES = ["issue", "feature"]
+EXTERNAL_COLUMNS = {
+    "external_source": "TEXT",
+    "external_id": "TEXT",
+    "external_url": "TEXT",
+    "external_repo": "TEXT",
+    "external_state": "TEXT",
+    "external_updated": "TEXT",
+    "external_comment": "TEXT",
+}
 
 
 def init_db():
@@ -34,7 +46,9 @@ def init_db():
         created_date TEXT NOT NULL,
         updated_date TEXT NOT NULL
     )''')
-    
+
+    ensure_columns(conn)
+
     conn.commit()
     conn.close()
 
@@ -44,6 +58,15 @@ def get_db():
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def ensure_columns(conn):
+    """Add missing columns for newer features."""
+    c = conn.cursor()
+    existing = {row[1] for row in c.execute("PRAGMA table_info(items)")}
+    for column, col_type in EXTERNAL_COLUMNS.items():
+        if column not in existing:
+            c.execute(f"ALTER TABLE items ADD COLUMN {column} {col_type}")
 
 
 def add_item(title, description=None, item_type="issue", priority=0):
@@ -129,7 +152,7 @@ def show_item(item_id):
     return True
 
 
-def update_status(item_id, new_status):
+def update_status(item_id, new_status, comment=None):
     """Update the status of an item."""
     if new_status not in VALID_STATUSES:
         print(f"Error: status must be one of {VALID_STATUSES}")
@@ -147,8 +170,10 @@ def update_status(item_id, new_status):
         return False
     
     now = datetime.now().isoformat()
-    c.execute("UPDATE items SET status = ?, updated_date = ? WHERE id = ?",
-              (new_status, now, item_id))
+    c.execute(
+        "UPDATE items SET status = ?, updated_date = ?, external_comment = COALESCE(?, external_comment) WHERE id = ?",
+        (new_status, now, comment, item_id),
+    )
     conn.commit()
     conn.close()
     
@@ -189,11 +214,289 @@ def export_json():
     
     data = [dict(item) for item in items]
     
-    export_file = EXPORT_DIR / "items.json"
-    with open(export_file, 'w') as f:
+    with open(EXPORT_FILE, 'w') as f:
         json.dump(data, f, indent=2)
     
-    print(f"✓ Exported {len(data)} items to {export_file}")
+    print(f"✓ Exported {len(data)} items to {EXPORT_FILE}")
+
+
+def check_gh_cli():
+    """Check if GitHub CLI (gh) is installed and runnable."""
+    gh_path = shutil.which("gh")
+    if not gh_path:
+        print(
+            "Error: GitHub CLI (gh) not found.\n"
+            "Install with:\n"
+            "  brew install gh\n"
+            "or see https://cli.github.com",
+            file=sys.stderr,
+        )
+        return False
+
+    result = subprocess.run(["gh", "--version"], capture_output=True, text=True)
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        print(
+            "Error: GitHub CLI (gh) was found but failed to run.",
+            file=sys.stderr,
+        )
+        if stderr:
+            print(stderr, file=sys.stderr)
+        print(
+            "Try reinstalling:\n"
+            "  brew install gh\n"
+            "or see https://cli.github.com",
+            file=sys.stderr,
+        )
+        return False
+
+    version_line = result.stdout.strip().splitlines()[0] if result.stdout else "gh (unknown version)"
+    print(f"✓ GitHub CLI detected: {version_line}")
+    return True
+
+
+def parse_iso8601(value):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def run_gh(args):
+    result = subprocess.run(["gh", *args], capture_output=True, text=True)
+    if result.returncode != 0:
+        stderr = result.stderr.strip() or "Unknown error"
+        print("Error: GitHub CLI command failed.", file=sys.stderr)
+        print(stderr, file=sys.stderr)
+        return None
+    return result.stdout
+
+
+def map_github_state(state):
+    return "completed" if state == "closed" else "proposed"
+
+
+def import_github(repo, state="all", limit=200):
+    if not check_gh_cli():
+        return False
+
+    output = run_gh([
+        "issue",
+        "list",
+        "--repo",
+        repo,
+        "--state",
+        state,
+        "--limit",
+        str(limit),
+        "--json",
+        "number,title,body,state,url,updatedAt",
+    ])
+    if output is None:
+        return False
+
+    try:
+        issues = json.loads(output)
+    except json.JSONDecodeError:
+        print("Error: Failed to parse GitHub CLI output.", file=sys.stderr)
+        return False
+
+    conn = get_db()
+    c = conn.cursor()
+    created = 0
+    updated = 0
+
+    for issue in issues:
+        external_id = str(issue.get("number"))
+        title = issue.get("title") or "(untitled)"
+        body = issue.get("body") or None
+        external_state = issue.get("state") or "open"
+        external_url = issue.get("url")
+        external_updated = issue.get("updatedAt")
+        mapped_status = map_github_state(external_state)
+
+        c.execute(
+            "SELECT id, updated_date, external_updated FROM items WHERE external_source = ? AND external_id = ? AND external_repo = ?",
+            ("github", external_id, repo),
+        )
+        row = c.fetchone()
+
+        if not row:
+            now = datetime.now().isoformat()
+            c.execute(
+                """INSERT INTO items
+                   (title, description, type, status, priority, created_date, updated_date,
+                    external_source, external_id, external_url, external_repo, external_state, external_updated)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    title,
+                    body,
+                    "issue",
+                    mapped_status,
+                    0,
+                    now,
+                    now,
+                    "github",
+                    external_id,
+                    external_url,
+                    repo,
+                    external_state,
+                    external_updated,
+                ),
+            )
+            created += 1
+            continue
+
+        local_updated = parse_iso8601(row["updated_date"])
+        remote_updated = parse_iso8601(external_updated)
+        should_update = True
+        if local_updated and remote_updated and remote_updated <= local_updated:
+            should_update = False
+
+        if should_update:
+            now = datetime.now().isoformat()
+            c.execute(
+                """UPDATE items
+                   SET title = ?, description = ?, status = ?, updated_date = ?,
+                       external_url = ?, external_state = ?, external_updated = ?
+                   WHERE id = ?""",
+                (
+                    title,
+                    body,
+                    mapped_status,
+                    now,
+                    external_url,
+                    external_state,
+                    external_updated,
+                    row["id"],
+                ),
+            )
+            updated += 1
+        else:
+            c.execute(
+                """UPDATE items
+                   SET external_url = ?, external_state = ?, external_updated = ?
+                   WHERE id = ?""",
+                (external_url, external_state, external_updated, row["id"]),
+            )
+
+    conn.commit()
+    conn.close()
+
+    print(f"✓ Imported {created} issue(s), updated {updated} issue(s) from {repo}")
+    return True
+
+
+def push_github(repo, dry_run=False):
+    if not check_gh_cli():
+        return False
+
+    conn = get_db()
+    c = conn.cursor()
+    c.execute(
+        """SELECT id, external_id, external_comment, status, external_state
+           FROM items
+           WHERE external_source = ? AND external_repo = ? AND status IN ('completed', 'done')""",
+        ("github", repo),
+    )
+    items = c.fetchall()
+
+    if not items:
+        print("No completed items to sync.")
+        conn.close()
+        return True
+
+    updated = 0
+    for item in items:
+        if item["external_state"] == "closed":
+            continue
+        issue_number = item["external_id"]
+        comment = item["external_comment"]
+
+        if dry_run:
+            action = "close"
+            if comment:
+                action = "comment + close"
+            print(f"• Would {action} GitHub issue #{issue_number} in {repo}")
+            continue
+
+        if comment:
+            result = run_gh([
+                "issue",
+                "comment",
+                issue_number,
+                "--repo",
+                repo,
+                "--body",
+                comment,
+            ])
+            if result is None:
+                continue
+
+        result = run_gh([
+            "issue",
+            "close",
+            issue_number,
+            "--repo",
+            repo,
+        ])
+        if result is None:
+            continue
+
+        now = datetime.now().isoformat()
+        c.execute(
+            "UPDATE items SET external_state = ?, external_updated = ?, external_comment = NULL WHERE id = ?",
+            ("closed", now, item["id"]),
+        )
+        updated += 1
+
+    conn.commit()
+    conn.close()
+
+    if dry_run:
+        print("✓ Dry run complete.")
+    else:
+        print(f"✓ Synced {updated} issue(s) to {repo}")
+    return True
+
+
+def run_git(args, cwd):
+    result = subprocess.run(["git", *args], capture_output=True, text=True, cwd=cwd)
+    if result.returncode != 0:
+        stderr = result.stderr.strip() or "Unknown error"
+        print("Error: git command failed.", file=sys.stderr)
+        print(stderr, file=sys.stderr)
+        return None
+    return result.stdout
+
+
+def sync_export_commit(message="eb export"):
+    """Export items, stage the export, and commit."""
+    export_json()
+
+    repo_root = Path(__file__).resolve().parents[1]
+    if run_git(["rev-parse", "--is-inside-work-tree"], cwd=repo_root) is None:
+        return False
+
+    relative_export = EXPORT_FILE.relative_to(repo_root)
+    status = run_git(["status", "--porcelain", str(relative_export)], cwd=repo_root)
+    if status is None:
+        return False
+
+    if not status.strip():
+        print("No changes to commit.")
+        return True
+
+    if run_git(["add", str(relative_export)], cwd=repo_root) is None:
+        return False
+
+    if run_git(["commit", "-m", message], cwd=repo_root) is None:
+        return False
+
+    print(f"✓ Committed {relative_export}")
+    return True
 
 
 def main():
@@ -209,6 +512,9 @@ Examples:
   eb status 1 "ready"
   eb delete 1
   eb export
+  eb gh
+  eb github import owner/repo
+  eb sync
         """
     )
     
@@ -234,6 +540,7 @@ Examples:
     status_parser = subparsers.add_parser("status", help="Update item status")
     status_parser.add_argument("id", type=int, help="Item ID")
     status_parser.add_argument("status", choices=VALID_STATUSES, help="New status")
+    status_parser.add_argument("--comment", help="Comment to sync with external issue close")
     
     # Delete command
     delete_parser = subparsers.add_parser("delete", help="Delete an item")
@@ -241,6 +548,26 @@ Examples:
     
     # Export command
     export_parser = subparsers.add_parser("export", help="Export items to JSON")
+
+    # Sync command
+    sync_parser = subparsers.add_parser("sync", help="Export items and commit JSON")
+    sync_parser.add_argument("-m", "--message", default="eb export", help="Commit message")
+
+    # GitHub CLI check command
+    gh_parser = subparsers.add_parser("gh", help="Check GitHub CLI (gh) availability")
+
+    # GitHub sync commands
+    github_parser = subparsers.add_parser("github", help="GitHub issue sync")
+    github_subparsers = github_parser.add_subparsers(dest="github_command", help="GitHub command to run")
+
+    github_import = github_subparsers.add_parser("import", help="Import issues from GitHub")
+    github_import.add_argument("repo", help="Repository (owner/repo)")
+    github_import.add_argument("--state", choices=["open", "closed", "all"], default="all", help="Issue state")
+    github_import.add_argument("--limit", type=int, default=200, help="Max issues to import")
+
+    github_push = github_subparsers.add_parser("push", help="Push completed items to GitHub")
+    github_push.add_argument("repo", help="Repository (owner/repo)")
+    github_push.add_argument("--dry-run", action="store_true", help="Show actions without applying them")
     
     args = parser.parse_args()
     
@@ -259,11 +586,22 @@ Examples:
     elif args.command == "show":
         show_item(args.id)
     elif args.command == "status":
-        update_status(args.id, args.status)
+        update_status(args.id, args.status, args.comment)
     elif args.command == "delete":
         delete_item(args.id)
     elif args.command == "export":
         export_json()
+    elif args.command == "gh":
+        check_gh_cli()
+    elif args.command == "sync":
+        sync_export_commit(args.message)
+    elif args.command == "github":
+        if not args.github_command:
+            github_parser.print_help()
+        elif args.github_command == "import":
+            import_github(args.repo, args.state, args.limit)
+        elif args.github_command == "push":
+            push_github(args.repo, args.dry_run)
 
 
 if __name__ == "__main__":
